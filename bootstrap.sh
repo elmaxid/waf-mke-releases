@@ -84,6 +84,17 @@ else
     CURL_PROTO=https
 fi
 
+# The release signing public key. Identical to deploy/release-signing.pub.pem
+# and to the key built into waf-mke (scripts/bootstrap_test.sh and a Go test
+# check both). Kept in this one place: the user-side and the root-side checks
+# both write it from here.
+EMBEDDED_PUBKEY=$(cat <<'PEM'
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAAYrUYhwLwqgoIb3P5TEZJr6N0dehgm/kI94i/ZbGRUg=
+-----END PUBLIC KEY-----
+PEM
+)
+
 WORK=$(mktemp -d /tmp/waf-mke-bootstrap.XXXXXX)
 ROOTDIR=
 cleanup() {
@@ -211,13 +222,7 @@ if [ -n "$WAF_MKE_PUBKEY_FILE" ]; then
     PUBKEY=$WAF_MKE_PUBKEY_FILE   # tests only
 else
     PUBKEY=$WORK/release-signing.pub.pem
-    # Identical to deploy/release-signing.pub.pem and to the key built into
-    # waf-mke (scripts/bootstrap_test.sh and a Go test check both).
-    cat > "$PUBKEY" <<'PEM'
------BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEAAYrUYhwLwqgoIb3P5TEZJr6N0dehgm/kI94i/ZbGRUg=
------END PUBLIC KEY-----
-PEM
+    printf '%s\n' "$EMBEDDED_PUBKEY" > "$PUBKEY"
 fi
 
 openssl pkeyutl -verify -pubin -inkey "$PUBKEY" -rawin -in "$WORK/checksums.txt" -sigfile "$WORK/checksums.txt.sig" >/dev/null 2>&1 \
@@ -235,12 +240,14 @@ BIN="$WORK/${TARBALL%.tar.gz}/waf-mke"
 [ -x "$BIN" ] || fail "the tarball did not contain an executable waf-mke"
 
 # --- hand the verified bytes to root ------------------------------------------
-# The temp dir belongs to the invoking user, who could swap the file between
-# verification and `sudo` running it. So when not root, the verified binary is
-# copied into a root-owned private dir, re-hashed there as root and compared
-# with the hash taken right after the tarball was verified and extracted; only
-# that copy is ever run. As root the temp dir is root-owned already.
-VERIFIED_SHA=$(sha256sum "$BIN" | awk '{ print $1 }')
+# The temp dir belongs to the invoking user, and any process of that user can
+# swap files in it at any moment, so nothing verified there can be trusted by
+# root afterwards (a hash taken there can be of an already-swapped file). When
+# not root, the signed checksums.txt, its signature and the tarball are copied
+# into a root-owned 0700 dir and EVERY check is done again there, as root:
+# the signature, the tarball sha256 against that checksums.txt, the extraction.
+# Only the binary extracted there is ever run. As root the temp dir is
+# root-owned already.
 if [ "$(id -u)" = "0" ]; then
     RUNBIN=$BIN
     run_root() { "$@"; }
@@ -248,12 +255,26 @@ else
     say "bootstrap: needs root; asking for sudo (the download above never ran as root)"
     run_root() { sudo "$@"; }
     ROOTDIR=$(sudo mktemp -d /tmp/waf-mke-bootstrap-root.XXXXXX) || fail "cannot create a root-owned directory with sudo"
-    sudo install -m 0700 "$BIN" "$ROOTDIR/waf-mke" || fail "cannot copy the binary into the root-owned directory"
-    ROOT_SHA=$(sudo sha256sum "$ROOTDIR/waf-mke" | awk '{ print $1 }')
-    if [ -z "$VERIFIED_SHA" ] || [ "$ROOT_SHA" != "$VERIFIED_SHA" ]; then
-        fail "the binary changed after verification (sha256 $ROOT_SHA, verified $VERIFIED_SHA); refusing to run it as root (nothing was changed)"
+    for f in checksums.txt checksums.txt.sig "$TARBALL"; do
+        sudo install -m 0600 "$WORK/$f" "$ROOTDIR/$f" || fail "cannot copy $f into the root-owned directory"
+    done
+    # The key root checks with: the embedded one, written by root from this
+    # script's own text (never the copy in the user's dir); only the test-mode
+    # override file is copied as is.
+    if [ -n "$WAF_MKE_PUBKEY_FILE" ]; then
+        sudo install -m 0600 "$WAF_MKE_PUBKEY_FILE" "$ROOTDIR/release-signing.pub.pem" || fail "cannot copy the test public key into the root-owned directory"
+    else
+        printf '%s\n' "$EMBEDDED_PUBKEY" | sudo sh -c 'umask 077; cat > "$1"' sh "$ROOTDIR/release-signing.pub.pem" \
+            || fail "cannot write the public key into the root-owned directory"
     fi
-    RUNBIN=$ROOTDIR/waf-mke
+    sudo openssl pkeyutl -verify -pubin -inkey "$ROOTDIR/release-signing.pub.pem" -rawin -in "$ROOTDIR/checksums.txt" -sigfile "$ROOTDIR/checksums.txt.sig" >/dev/null 2>&1 \
+        || fail "the signature of checksums.txt does NOT verify as root (the files changed after the first check?); refusing to run anything as root (nothing was changed)"
+    # shellcheck disable=SC2016
+    sudo sh -c 'cd "$1" && grep " $2\$" checksums.txt | sha256sum -c - >/dev/null' sh "$ROOTDIR" "$TARBALL" \
+        || fail "the tarball changed after verification (sha256 does not match the signed checksums.txt as root); refusing to run anything as root (nothing was changed)"
+    sudo tar -C "$ROOTDIR" -xzf "$ROOTDIR/$TARBALL" || fail "cannot extract the verified tarball as root"
+    RUNBIN=$ROOTDIR/${TARBALL%.tar.gz}/waf-mke
+    sudo test -x "$RUNBIN" || fail "the verified tarball did not contain an executable waf-mke"
 fi
 
 # --- check the host, then install -------------------------------------------
